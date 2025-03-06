@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/bxtal-lsn/supper/internal/age"
+	"github.com/bxtal-lsn/supper/internal/errors"
 	"github.com/bxtal-lsn/supper/internal/ui/components"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/spinner"
@@ -17,24 +19,28 @@ import (
 
 // Key manager states
 const (
-	stateIdle int = iota
-	stateGeneratingKey
-	stateInputPassphrase
-	stateConfirmPassphrase
-	stateDecryptingKey
-	stateDeletingKey
+	StateIdle = iota
+	StateGeneratingKey
+	StateInputPassphrase
+	StateConfirmPassphrase
+	StateDecryptingKey
+	StateDeletingKey
 )
 
 // Key manager events
 type keyGenerated struct {
 	keyPair *age.KeyPair
+	err     error // Add error field to event
 }
 
 type keyDecrypted struct {
 	key string
+	err error // Add error field to event
 }
 
-type keyDeleted struct{}
+type keyDeleted struct {
+	err error // Add error field to event
+}
 
 // KeyManagerView is the view for managing age keys
 type KeyManagerView struct {
@@ -63,7 +69,7 @@ func NewKeyManagerView() *KeyManagerView {
 	return &KeyManagerView{
 		keys:               DefaultKeyMap(),
 		spinner:            s,
-		state:              stateIdle,
+		state:              StateIdle,
 		encryptedKeyPath:   age.DefaultEncryptedKeyPath(),
 		decryptedKeyPath:   age.DefaultKeyPath(),
 		autoDeleteInterval: 30 * time.Minute, // Auto-delete decrypted key after 30 minutes
@@ -92,22 +98,22 @@ func (k *KeyManagerView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		// Global key handlers
 		switch {
-		case key.Matches(msg, k.keys.GenerateKey) && k.state == stateIdle:
-			k.state = stateInputPassphrase
+		case key.Matches(msg, k.keys.GenerateKey) && k.state == StateIdle:
+			k.state = StateInputPassphrase
 			k.passphraseInput = components.NewPassphraseInput("Enter passphrase for new key", true)
 			return k, k.passphraseInput.Init()
 
-		case key.Matches(msg, k.keys.DecryptKey) && k.state == stateIdle:
+		case key.Matches(msg, k.keys.DecryptKey) && k.state == StateIdle:
 			if _, err := os.Stat(k.encryptedKeyPath); os.IsNotExist(err) {
-				k.err = fmt.Errorf("no encrypted key found at %s", k.encryptedKeyPath)
+				k.err = errors.Wrap(err, errors.TypeFileOperation, "No encrypted key found")
 				return k, nil
 			}
-			k.state = stateDecryptingKey
+			k.state = StateDecryptingKey
 			k.passphraseInput = components.NewPassphraseInput("Enter passphrase to decrypt key", false)
 			return k, k.passphraseInput.Init()
 
-		case key.Matches(msg, k.keys.DeleteKey) && k.state == stateIdle && k.hasDecryptedKey:
-			k.state = stateDeletingKey
+		case key.Matches(msg, k.keys.DeleteKey) && k.state == StateIdle && k.hasDecryptedKey:
+			k.state = StateDeletingKey
 			return k, k.deleteDecryptedKey()
 		}
 
@@ -118,30 +124,37 @@ func (k *KeyManagerView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case keyGenerated:
 		k.keyPair = msg.keyPair
-		k.state = stateIdle
+		k.err = msg.err // Handle possible error from key generation
+		k.state = StateIdle
 		cmds = append(cmds, k.checkKeyStatus())
 
 	case keyDecrypted:
-		k.state = stateIdle
-		k.keyDecryptedTime = time.Now()
+		k.state = StateIdle
+		if msg.err != nil {
+			k.err = msg.err
+		} else {
+			k.err = nil
+			k.keyDecryptedTime = time.Now()
+			// Set a timer to auto-delete the key
+			cmds = append(cmds, tea.Tick(k.autoDeleteInterval, func(t time.Time) tea.Msg {
+				return tea.KeyMsg{Type: tea.KeyCtrlD}
+			}))
+		}
 		cmds = append(cmds, k.checkKeyStatus())
-		// Set a timer to auto-delete the key
-		cmds = append(cmds, tea.Tick(k.autoDeleteInterval, func(t time.Time) tea.Msg {
-			return tea.KeyMsg{Type: tea.KeyCtrlD}
-		}))
 
 	case keyDeleted:
-		k.state = stateIdle
+		k.state = StateIdle
+		k.err = msg.err // Handle possible error from key deletion
 		cmds = append(cmds, k.checkKeyStatus())
 
 	case components.PassphraseConfirmedMsg:
 		switch k.state {
-		case stateInputPassphrase:
+		case StateInputPassphrase:
 			return k, tea.Batch(
 				k.generateKey(msg.Passphrase),
 				k.spinner.Tick,
 			)
-		case stateDecryptingKey:
+		case StateDecryptingKey:
 			return k, tea.Batch(
 				k.decryptKey(msg.Passphrase),
 				k.spinner.Tick,
@@ -149,11 +162,11 @@ func (k *KeyManagerView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case components.PassphraseCancelledMsg:
-		k.state = stateIdle
+		k.state = StateIdle
 	}
 
 	// Update sub-components
-	if k.passphraseInput != nil && (k.state == stateInputPassphrase || k.state == stateDecryptingKey) {
+	if k.passphraseInput != nil && (k.state == StateInputPassphrase || k.state == StateDecryptingKey) {
 		newModel, cmd := k.passphraseInput.Update(msg)
 		if updatedModel, ok := newModel.(*components.PassphraseInput); ok {
 			k.passphraseInput = updatedModel
@@ -169,15 +182,15 @@ func (k *KeyManagerView) View() string {
 	var content string
 
 	switch k.state {
-	case stateIdle:
+	case StateIdle:
 		content = k.renderIdleState()
-	case stateGeneratingKey:
+	case StateGeneratingKey:
 		content = fmt.Sprintf("%s Generating key...", k.spinner.View())
-	case stateInputPassphrase, stateDecryptingKey:
+	case StateInputPassphrase, StateDecryptingKey:
 		if k.passphraseInput != nil {
 			content = k.passphraseInput.View()
 		}
-	case stateDeletingKey:
+	case StateDeletingKey:
 		content = fmt.Sprintf("%s Securely deleting key...", k.spinner.View())
 	}
 
@@ -193,11 +206,11 @@ func (k *KeyManagerView) renderIdleState() string {
 	var content string
 
 	keyStyle := lipgloss.NewStyle().Width(60).Border(lipgloss.RoundedBorder()).Padding(1)
-	errorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000"))
 	infoStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#00AA00"))
 
+	// Display error if one exists
 	if k.err != nil {
-		content += errorStyle.Render(fmt.Sprintf("Error: %s", k.err)) + "\n\n"
+		content += errors.FormatErrorForDisplay(k.err) + "\n\n"
 	}
 
 	if k.hasDecryptedKey {
@@ -213,7 +226,7 @@ func (k *KeyManagerView) renderIdleState() string {
 		content += fmt.Sprintf("Public Key: %s\n\n", k.keyPair.PublicKey)
 		content += "Press 'x' to securely delete the decrypted key now.\n\n"
 	} else {
-		content += "Key Status: " + errorStyle.Render("Not Decrypted") + "\n\n"
+		content += "Key Status: " + lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000")).Render("Not Decrypted") + "\n\n"
 
 		if _, err := os.Stat(k.encryptedKeyPath); err == nil {
 			content += fmt.Sprintf("Encrypted Key Path: %s\n", k.encryptedKeyPath)
@@ -254,87 +267,123 @@ func (k *KeyManagerView) checkKeyStatus() tea.Cmd {
 
 // generateKey generates a new age key
 func (k *KeyManagerView) generateKey(passphrase string) tea.Cmd {
-	k.state = stateGeneratingKey
+	k.state = StateGeneratingKey
 	k.err = nil
 
 	return func() tea.Msg {
 		// Generate key
 		keyPair, err := age.GenerateKey()
 		if err != nil {
-			k.err = fmt.Errorf("failed to generate key: %w", err)
-			return keyGenerated{keyPair: nil}
+			return keyGenerated{
+				keyPair: nil,
+				err: errors.Wrap(err, errors.TypeKeyManagement,
+					"Failed to generate key"),
+			}
 		}
 
 		// Encrypt with passphrase
 		encryptedKey, err := age.EncryptKey(keyPair, passphrase)
 		if err != nil {
-			k.err = fmt.Errorf("failed to encrypt key: %w", err)
-			return keyGenerated{keyPair: nil}
+			return keyGenerated{
+				keyPair: nil,
+				err: errors.Wrap(err, errors.TypeKeyManagement,
+					"Failed to encrypt key"),
+			}
 		}
 
 		// Ensure directory exists
 		if err := os.MkdirAll(filepath.Dir(k.encryptedKeyPath), 0o700); err != nil {
-			k.err = fmt.Errorf("failed to create directory: %w", err)
-			return keyGenerated{keyPair: nil}
+			return keyGenerated{
+				keyPair: nil,
+				err: errors.Wrap(err, errors.TypeFileOperation,
+					"Failed to create directory").WithData("path", k.encryptedKeyPath),
+			}
 		}
 
 		// Save encrypted key
 		if err := age.SaveEncryptedKey(encryptedKey, k.encryptedKeyPath); err != nil {
-			k.err = fmt.Errorf("failed to save encrypted key: %w", err)
-			return keyGenerated{keyPair: nil}
+			return keyGenerated{
+				keyPair: nil,
+				err: errors.Wrap(err, errors.TypeFileOperation,
+					"Failed to save encrypted key").WithData("path", k.encryptedKeyPath),
+			}
 		}
 
 		// Save decrypted key
 		if err := age.SaveKey(keyPair, k.decryptedKeyPath); err != nil {
-			k.err = fmt.Errorf("failed to save decrypted key: %w", err)
-			return keyGenerated{keyPair: nil}
+			return keyGenerated{
+				keyPair: nil,
+				err: errors.Wrap(err, errors.TypeFileOperation,
+					"Failed to save decrypted key").WithData("path", k.decryptedKeyPath),
+			}
 		}
 
-		return keyGenerated{keyPair: keyPair}
+		return keyGenerated{keyPair: keyPair, err: nil}
 	}
 }
 
 // decryptKey decrypts an age key
 func (k *KeyManagerView) decryptKey(passphrase string) tea.Cmd {
-	k.state = stateDecryptingKey
+	k.state = StateDecryptingKey
 	k.err = nil
 
 	return func() tea.Msg {
 		// Load encrypted key
 		encryptedKey, err := age.LoadEncryptedKey(k.encryptedKeyPath)
 		if err != nil {
-			k.err = fmt.Errorf("failed to load encrypted key: %w", err)
-			return keyDecrypted{key: ""}
+			return keyDecrypted{
+				key: "",
+				err: errors.Wrap(err, errors.TypeFileOperation,
+					"Failed to load encrypted key").WithData("path", k.encryptedKeyPath),
+			}
 		}
 
-		// Decrypt key
+		// Decrypt key with passphrase
 		decryptedKey, err := age.DecryptKey(encryptedKey, passphrase)
 		if err != nil {
-			k.err = fmt.Errorf("failed to decrypt key: %w", err)
-			return keyDecrypted{key: ""}
+			// Check for common errors
+			if strings.Contains(err.Error(), "incorrect passphrase") ||
+				strings.Contains(err.Error(), "failed to decrypt") {
+				return keyDecrypted{
+					key: "",
+					err: errors.New(errors.TypeSecurity,
+						"Incorrect passphrase provided"),
+				}
+			}
+
+			return keyDecrypted{
+				key: "",
+				err: errors.Wrap(err, errors.TypeSecurity,
+					"Failed to decrypt key"),
+			}
 		}
 
 		// Save decrypted key
 		if err := os.MkdirAll(filepath.Dir(k.decryptedKeyPath), 0o700); err != nil {
-			k.err = fmt.Errorf("failed to create directory: %w", err)
-			return keyDecrypted{key: ""}
+			return keyDecrypted{
+				key: "",
+				err: errors.Wrap(err, errors.TypeFileOperation,
+					"Failed to create directory for decrypted key").WithData("path", k.decryptedKeyPath),
+			}
 		}
 
 		if err := os.WriteFile(k.decryptedKeyPath, []byte(decryptedKey), 0o600); err != nil {
-			k.err = fmt.Errorf("failed to save decrypted key: %w", err)
-			return keyDecrypted{key: ""}
+			return keyDecrypted{
+				key: "",
+				err: errors.Wrap(err, errors.TypeFileOperation,
+					"Failed to save decrypted key").WithData("path", k.decryptedKeyPath),
+			}
 		}
 
-		// This is a simplification - proper parsing would be more complex
-		// Extract public key from private key (would require proper age key parsing)
-		publicKey := "age1..." // Placeholder
+		// Extract public key from private key
+		publicKey := "age1..." // Placeholder - implement proper extraction
 		k.keyPair = &age.KeyPair{
 			PrivateKey:  decryptedKey,
 			PublicKey:   publicKey,
 			IsEncrypted: false,
 		}
 
-		return keyDecrypted{key: decryptedKey}
+		return keyDecrypted{key: decryptedKey, err: nil}
 	}
 }
 
@@ -344,10 +393,13 @@ func (k *KeyManagerView) deleteDecryptedKey() tea.Cmd {
 
 	return func() tea.Msg {
 		if err := age.SecurelyDeleteKey(k.decryptedKeyPath); err != nil {
-			k.err = fmt.Errorf("failed to delete key: %w", err)
+			return keyDeleted{
+				err: errors.Wrap(err, errors.TypeFileOperation,
+					"Failed to securely delete key").WithData("path", k.decryptedKeyPath),
+			}
 		}
 		k.keyPair = nil
-		return keyDeleted{}
+		return keyDeleted{err: nil}
 	}
 }
 

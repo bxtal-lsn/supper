@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -67,17 +68,49 @@ func GenerateKey() (*KeyPair, error) {
 
 // EncryptKey encrypts an age key with a passphrase
 func EncryptKey(key *KeyPair, passphrase string) ([]byte, error) {
-	cmd := exec.Command("age", "-p", "-o", "-")
-	cmd.Stdin = strings.NewReader(key.PrivateKey)
+	// Create a temporary file to write the private key
+	tmpFile, err := os.CreateTemp("", "age-key-*.txt")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temporary file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath) // Clean up temp file
 
-	// Provide passphrase via environment variable to avoid command line exposure
-	cmd.Env = append(os.Environ(), fmt.Sprintf("AGE_PASSPHRASE=%s", passphrase))
+	// Write the private key to the temp file
+	if _, err := tmpFile.WriteString(key.PrivateKey); err != nil {
+		tmpFile.Close()
+		return nil, fmt.Errorf("failed to write private key to temporary file: %w", err)
+	}
+	tmpFile.Close()
 
+	// Set up command to encrypt using stdin for passphrase
+	cmd := exec.Command("age", "-p", "-o", "-", tmpPath)
+
+	// Connect passphrase to stdin
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create stdin pipe: %w", err)
+	}
+
+	// Start the command before writing to stdin
 	var out bytes.Buffer
+	var errOut bytes.Buffer
 	cmd.Stdout = &out
+	cmd.Stderr = &errOut
 
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("failed to encrypt age key: %w", err)
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start age command: %w", err)
+	}
+
+	// Write passphrase to stdin twice (age requires confirmation)
+	if _, err := io.WriteString(stdin, passphrase+"\n"+passphrase+"\n"); err != nil {
+		return nil, fmt.Errorf("failed to write passphrase: %w", err)
+	}
+	stdin.Close()
+
+	// Wait for command to complete
+	if err := cmd.Wait(); err != nil {
+		return nil, fmt.Errorf("failed to encrypt key: %s - %w", errOut.String(), err)
 	}
 
 	return out.Bytes(), nil
@@ -85,17 +118,49 @@ func EncryptKey(key *KeyPair, passphrase string) ([]byte, error) {
 
 // DecryptKey decrypts an encrypted age key
 func DecryptKey(encryptedKey []byte, passphrase string) (string, error) {
-	cmd := exec.Command("age", "-d")
-	cmd.Stdin = bytes.NewReader(encryptedKey)
+	// Create a temporary file for the encrypted key
+	tmpFile, err := os.CreateTemp("", "age-encrypted-*.key")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temporary file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath) // Clean up temp file
 
-	// Provide passphrase via environment variable to avoid command line exposure
-	cmd.Env = append(os.Environ(), fmt.Sprintf("AGE_PASSPHRASE=%s", passphrase))
+	// Write encrypted key to temp file
+	if _, err := tmpFile.Write(encryptedKey); err != nil {
+		tmpFile.Close()
+		return "", fmt.Errorf("failed to write to temporary file: %w", err)
+	}
+	tmpFile.Close()
 
+	// Set up command to use stdin for passphrase instead of env var
+	cmd := exec.Command("age", "-d", "-i", tmpPath)
+
+	// Connect passphrase to stdin
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return "", fmt.Errorf("failed to create stdin pipe: %w", err)
+	}
+
+	// Start the command before writing to stdin
 	var out bytes.Buffer
+	var errOut bytes.Buffer
 	cmd.Stdout = &out
+	cmd.Stderr = &errOut
 
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("failed to decrypt age key: %w", err)
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("failed to start age command: %w", err)
+	}
+
+	// Write passphrase to stdin and close
+	if _, err := io.WriteString(stdin, passphrase+"\n"); err != nil {
+		return "", fmt.Errorf("failed to write passphrase: %w", err)
+	}
+	stdin.Close()
+
+	// Wait for command to complete
+	if err := cmd.Wait(); err != nil {
+		return "", fmt.Errorf("failed to decrypt key: %s - %w", errOut.String(), err)
 	}
 
 	return out.String(), nil
@@ -150,7 +215,6 @@ func SecurelyDeleteKey(path string) error {
 	}
 
 	// Fallback: overwrite with zeros before deleting
-	zeros := make([]byte, 1024)
 	fileInfo, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("failed to stat key file: %w", err)
@@ -164,6 +228,7 @@ func SecurelyDeleteKey(path string) error {
 
 	// Overwrite file with zeros
 	size := fileInfo.Size()
+	zeros := make([]byte, 1024)
 	for written := int64(0); written < size; {
 		n, err := file.Write(zeros)
 		if err != nil {
@@ -185,3 +250,4 @@ func IsKeyDecrypted() bool {
 	_, err := os.Stat(DefaultKeyPath())
 	return err == nil
 }
+
